@@ -1,0 +1,99 @@
+#!/bin/bash
+set -e
+
+# Required env vars: HATHORA_HOSTNAME, HATHORA_DEFAULT_PORT, HATHORA_REGION
+GCP_PROJECT=hathora-dev-1ba2
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >&2
+}
+
+if [[ -z "$GCP_SERVICE_ACCOUNT_KEY_BASE64" ]]; then
+  echo "GCP_SERVICE_ACCOUNT_KEY_BASE64 is not set. Exiting." 
+  exit 1
+fi
+if [[ -z "$HATHORA_HOSTNAME" ]]; then
+  echo "HATHORA_HOSTNAME is not set. Exiting."
+  exit 1
+fi
+if [[ -z "$HATHORA_DEFAULT_PORT" ]]; then
+  echo "HATHORA_DEFAULT_PORT is not set. Exiting."
+  exit 1
+fi
+if [[ -z "$HATHORA_REGION" ]]; then
+  echo "HATHORA_REGION is not set. Exiting."
+  exit 1
+fi
+
+log "Decoding service account key from environment variable..."
+# Decode base64 string and save to temporary JSON file
+echo "$GCP_SERVICE_ACCOUNT_KEY_BASE64" | base64 -d > /tmp/gcp-sa-key.json
+# Set environment variable to point to the decoded service account key file
+gcloud auth activate-service-account --key-file=/tmp/gcp-sa-key.json
+gcloud config set project $GCP_PROJECT
+
+log "Starting entrypoint script."
+log "HATHORA_HOSTNAME: $HATHORA_HOSTNAME"
+log "HATHORA_DEFAULT_PORT: $HATHORA_DEFAULT_PORT"
+log "HATHORA_REGION: $HATHORA_REGION"
+log "GCP_PROJECT: $GCP_PROJECT"
+
+log "Detecting GCP zone and VM name from public IP..."
+GCP_VM_PUBLIC_IP=$(dig +short $HATHORA_HOSTNAME)
+GCP_ZONE=$(gcloud compute instances list --filter="networkInterfaces[0].accessConfigs[0].natIP=$GCP_VM_PUBLIC_IP" --format="value(zone)")
+GCP_VM_NAME=$(gcloud compute instances list --filter="networkInterfaces[0].accessConfigs[0].natIP=$GCP_VM_PUBLIC_IP" --format="value(name)")
+GCP_NEG_NAME="llm-serve-$GCP_ZONE"
+log "Detected GCP_VM_PUBLIC_IP: $GCP_VM_PUBLIC_IP"
+log "Detected GCP_ZONE: $GCP_ZONE"
+log "Detected GCP_VM_NAME: $GCP_VM_NAME"
+log "GCP_NEG_NAME: $GCP_NEG_NAME"
+
+function register_endpoint() {
+  log "Registering endpoint instance=$GCP_VM_NAME,port=$HATHORA_DEFAULT_PORT to NEG $GCP_NEG_NAME in $GCP_ZONE..."
+  local start_time=$(date +%s)
+  gcloud compute network-endpoint-groups update \
+    "$GCP_NEG_NAME" \
+    --project="$GCP_PROJECT" \
+    --zone="$GCP_ZONE" \
+    --add-endpoint="instance=$GCP_VM_NAME,port=$HATHORA_DEFAULT_PORT"
+  local end_time=$(date +%s)
+  local duration=$((end_time - start_time))
+  log "Endpoint registered. Took ${duration}s."
+}
+
+function unregister_endpoint() {
+  log "Unregistering endpoint instance=$GCP_VM_NAME,port=$HATHORA_DEFAULT_PORT from NEG $GCP_NEG_NAME in $GCP_ZONE..."
+  local start_time=$(date +%s)
+  gcloud compute network-endpoint-groups update \
+    "$GCP_NEG_NAME" \
+    --project="$GCP_PROJECT" \
+    --zone="$GCP_ZONE" \
+    --remove-endpoint="instance=$GCP_VM_NAME,port=$HATHORA_DEFAULT_PORT"
+  local end_time=$(date +%s)
+  local duration=$((end_time - start_time))
+  log "Endpoint unregistered. Took ${duration}s."
+}
+
+CLEANED_UP=0
+function cleanup() {
+  if [[ $CLEANED_UP -eq 0 ]]; then
+    log "Running cleanup..."
+    unregister_endpoint
+    CLEANED_UP=1
+    log "Cleanup complete."
+  fi
+}
+
+trap cleanup EXIT
+trap cleanup ERR
+trap cleanup SIGTERM
+trap cleanup SIGINT
+
+register_endpoint
+
+log "Starting FastAPI server..."
+uvicorn main:app --host 0.0.0.0 --port 8000 &
+
+wait $!
+
+log "FastAPI server exited. Entrypoint script ending."
