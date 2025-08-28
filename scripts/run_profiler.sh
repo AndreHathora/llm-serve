@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "LLM Latency Comprehensive Analysis"
+echo "LLM Latency Profiling"
 echo "================================="
 
 if [ ! -f "scripts/baseurl.txt" ]; then
@@ -18,15 +18,15 @@ fi
 echo "Installing dependencies..."
 pip install -q requests numpy pandas matplotlib seaborn
 
-echo "Starting comprehensive latency analysis..."
-cd tests
-python comprehensive_latency_analyzer.py
+echo "Starting full profile latency analysis..."
+cd src
+python fullprofile.py
 
-if [ -f "../data/enhanced_latency_results.csv" ]; then
+if [ -f "../data/full_profile_latency_results.csv" ]; then
     echo "Analysis complete!"
     echo "Results saved to:"
-    echo "   - data/enhanced_latency_results.csv"
-    echo "   - data/enhanced_latency_analysis.png"
+    echo "   - data/full_profile_latency_results.csv"
+    echo "   - data/full_profile_latency_analysis.png"
     echo ""
     echo "Use this data for your blog post analysis."
 else

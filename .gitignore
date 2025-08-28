@@ -31,12 +31,6 @@ ENV/
 *.swp
 *.swo
 
-# Data files
-data/*.csv
-data/*.png
-data/*.jpg
-data/*.jpeg
-
 # Logs
 *.log
 
