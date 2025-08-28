@@ -11,6 +11,17 @@ from fastapi import FastAPI, Request, HTTPException
 import signal
 import sys
 
+# Add timing instrumentation
+import time
+from contextlib import contextmanager
+
+@contextmanager
+def timer(name: str):
+    start = time.time()
+    yield
+    elapsed = (time.time() - start) * 1000
+    print(f"[TIMING] {name}: {elapsed:.2f}ms")
+
 # Environment variable for Hathora region
 HATHORA_REGION = os.environ.get("HATHORA_REGION", "unknown")
 
@@ -32,8 +43,14 @@ def load_model_and_tokenizer(model_name: str, device):
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "distilbert/distilgpt2")
 print(f"Loading model: {MODEL_NAME}")
-DEVICE = get_device()
-MODEL, TOKENIZER = load_model_and_tokenizer(MODEL_NAME, DEVICE)
+
+with timer("device_detection"):
+    DEVICE = get_device()
+
+with timer("model_loading"):
+    MODEL, TOKENIZER = load_model_and_tokenizer(MODEL_NAME, DEVICE)
+
+print(f"Model loaded successfully on {DEVICE}")
 
 # --- Pydantic Models for OpenAI compatibility ---
 
@@ -93,23 +110,43 @@ def generate_response(
     model, tokenizer, inputs, prompt, max_tokens: int
 ):
     inference_start_time = time.time()
+    time_to_first_token = None
+    
+    # Manual generation to capture time to first token
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
+    generated = input_ids
+    past_key_values = None
+    
     with torch.no_grad():
-        output_sequences = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_length=inputs["input_ids"].shape[1] + max_tokens,
-            num_return_sequences=1,
-            do_sample=True,
-            top_p=0.95,
-            top_k=50,
-        )
+        for i in range(max_tokens):
+            outputs = model(
+                input_ids=generated if i == 0 else generated[:, -1:],
+                attention_mask=attention_mask if i == 0 else None,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            
+            # Capture time to first token
+            if i == 0:
+                time_to_first_token = time.time() - inference_start_time
+            
+            logits = outputs.logits[:, -1, :]
+            past_key_values = outputs.past_key_values
+            next_token_id = torch.argmax(logits, dim=-1, keepdim=True)
+            generated = torch.cat([generated, next_token_id], dim=-1)
+            
+            # Check if we hit EOS token
+            if next_token_id.item() == tokenizer.eos_token_id:
+                break
+    
     inference_end_time = time.time()
-    total_inference_latency_ms = (
-        inference_end_time - inference_start_time) * 1000
-    generated_text = tokenizer.decode(
-        output_sequences[0], skip_special_tokens=True)
+    total_inference_latency_ms = (inference_end_time - inference_start_time) * 1000
+    
+    generated_text = tokenizer.decode(generated[0], skip_special_tokens=True)
     response_text = generated_text[len(prompt):].strip()
-    return response_text, output_sequences, total_inference_latency_ms
+    
+    return response_text, generated, total_inference_latency_ms, time_to_first_token
 
 
 def build_non_streaming_response(
@@ -118,6 +155,7 @@ def build_non_streaming_response(
     output_sequences,
     inputs,
     total_inference_latency_ms: float,
+    time_to_first_token: float,
     device: str
 ) -> ChatCompletionResponse:
     completion_message = ChatMessage(role="assistant", content=response_text)
@@ -133,6 +171,7 @@ def build_non_streaming_response(
         model=request.model,
         choices=[choice],
         usage=usage,
+        time_to_first_token=time_to_first_token,
         total_inference_latency=total_inference_latency_ms,
         device=device,
     )
@@ -183,16 +222,31 @@ app = FastAPI()
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(request: ChatCompletionRequest, stream: Optional[bool] = False):
-    prompt = extract_prompt(request.messages)
-    inputs = tokenize_prompt(TOKENIZER, prompt, DEVICE)
+    total_start = time.time()
+    
+    with timer("prompt_extraction"):
+        prompt = extract_prompt(request.messages)
+    
+    with timer("tokenization"):
+        inputs = tokenize_prompt(TOKENIZER, prompt, DEVICE)
+    
     device_str = str(DEVICE)
+    
     if not stream:
-        response_text, output_sequences, total_inference_latency_ms = generate_response(
-            MODEL, TOKENIZER, inputs, prompt, request.max_tokens
-        )
-        return build_non_streaming_response(
-            request, response_text, output_sequences, inputs, total_inference_latency_ms, device_str
-        )
+        with timer("inference"):
+            response_text, output_sequences, total_inference_latency_ms, time_to_first_token = generate_response(
+                MODEL, TOKENIZER, inputs, prompt, request.max_tokens
+            )
+        
+        with timer("response_building"):
+            response = build_non_streaming_response(
+                request, response_text, output_sequences, inputs, total_inference_latency_ms, time_to_first_token, device_str
+            )
+        
+        total_time = (time.time() - total_start) * 1000
+        print(f"[TIMING] Total endpoint time: {total_time:.2f}ms")
+        
+        return response
     else:
         return StreamingResponse(
             stream_tokens(MODEL, TOKENIZER, inputs, prompt,
